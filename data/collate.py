@@ -20,6 +20,22 @@ def collate_fn(batch):
     return torch.stack(im, 0), torch.cat(label, 0), path, shapes
 
 
+# 三模态:每个样本返回 (visible, infared, depth, label, path, shapes),分别堆叠三个模态图像。
+def collate_fn3(batch):
+    """Collates tri-modal batches into three stacked image tensors plus concatenated labels, paths and shapes."""
+    im0, im1, im2, label, path, shapes = zip(*batch)  # transposed
+    for i, lb in enumerate(label):
+        lb[:, 0] = i  # add target image index for build_targets()
+    return (
+        torch.stack(im0, 0),
+        torch.stack(im1, 0),
+        torch.stack(im2, 0),
+        torch.cat(label, 0),
+        path,
+        shapes,
+    )
+
+
 # quad 模式:每 4 张拼成 1 张大图(2×2)或 2 倍上采样,再打包成 batch。
 def collate_fn4(batch):
     """Batches images, labels, paths, and shapes by grouping every 4 items for dataset loading."""

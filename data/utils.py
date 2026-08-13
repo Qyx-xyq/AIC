@@ -27,6 +27,10 @@ def letterbox(im, new_shape=(640, 640), color=(114, 114, 114), auto=True, scaleF
     if isinstance(new_shape, int):
         new_shape = (new_shape, new_shape)
 
+    # 多模态拼接图(如 HxWx9)需用标量填充色,OpenCV 的 borderValue 长度上限为 4。
+    if im.ndim == 3 and isinstance(color, (tuple, list)) and len(color) != im.shape[2]:
+        color = color[0]
+
     # Scale ratio (new / old)
     r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
     if not scaleup:  # only scale down, do not scale up (for better val mAP)

@@ -2,9 +2,9 @@
 """
 训练 YOLOv3 模型(比赛精简版)。
 
-数据加载 -> data11111new
-模型构建 -> models11111new
-损失/优化 -> losses11111new
+数据加载 -> data
+模型构建 -> models
+损失/优化 -> losses&optimizer
 辅助工具 -> train11111new/utils
 
 用法(单卡训练,推荐):
@@ -45,9 +45,9 @@ from ultralytics.utils.patches import torch_load
 from ultralytics.utils.torch_utils import TORCH_2_4, autocast
 
 import val as validate  # 每个 epoch 结束后计算 mAP
-from data11111new import create_dataloader
-from losses11111new import ComputeLoss, smart_optimizer
-from models11111new import Model
+from data import create_dataloader, dataset_num_modalities
+from losses_and_optimizer import ComputeLoss, smart_optimizer
+from models import Model
 from utils.autoanchor import check_anchors
 from utils.autobatch import check_train_batch_size
 from utils.callbacks import Callbacks
@@ -147,6 +147,9 @@ def train(hyp, opt, device, callbacks):
     nc = 1 if single_cls else int(data_dict["nc"])  # number of classes
     names = {0: "item"} if single_cls and len(data_dict["names"]) != 1 else data_dict["names"]  # class names
     is_coco = isinstance(val_path, str) and val_path.endswith("coco/val2017.txt")  # COCO dataset
+    # 三模态比赛:按数据集目录中的模态文件夹数量决定模型输入通道数(3 * 模态数)。
+    num_modalities = dataset_num_modalities(train_path) if isinstance(train_path, str) else 1
+    ch = 3 * num_modalities
 
     # Model
     check_suffix(weights, ".pt")  # check weights
@@ -155,14 +158,14 @@ def train(hyp, opt, device, callbacks):
         with torch_distributed_zero_first(LOCAL_RANK):
             weights = attempt_download(weights)  # download if not found locally
         ckpt = torch_load(weights, map_location="cpu")  # load checkpoint to CPU to avoid CUDA memory leak
-        model = Model(cfg or ckpt["model"].yaml, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
+        model = Model(cfg or ckpt["model"].yaml, ch=ch, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
         exclude = ["anchor"] if (cfg or hyp.get("anchors")) and not resume else []  # exclude keys
         csd = ckpt["model"].float().state_dict()  # checkpoint state_dict as FP32
         csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect
         model.load_state_dict(csd, strict=False)  # load
         LOGGER.info(f"Transferred {len(csd)}/{len(model.state_dict())} items from {weights}")  # report
     else:
-        model = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
+        model = Model(cfg, ch=ch, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
     amp = check_amp(model)  # check AMP
 
     # Freeze
@@ -320,9 +323,17 @@ def train(hyp, opt, device, callbacks):
         if RANK in {-1, 0}:
             pbar = TQDM(pbar, total=nb)  # progress bar
         optimizer.zero_grad()
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+        for i, batch in pbar:  # batch -------------------------------------------------------------
             callbacks.run("on_train_batch_start")
             ni = i + nb * epoch  # number integrated batches (since train start)
+            if num_modalities > 1:
+                im_vis, im_ir, im_dep, targets, paths, _ = batch
+                # 三模态早融合:通道维拼接后交给单骨干网络;若要换成其他融合结构,在此处修改。
+                imgs = torch.cat((im_vis, im_ir, im_dep), dim=1)
+                imgs_disp = im_vis  # 可视化/回调用可见光图
+            else:
+                imgs, targets, paths, _ = batch
+                imgs_disp = imgs
             imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
 
             # Warmup
@@ -375,7 +386,7 @@ def train(hyp, opt, device, callbacks):
                     ("%11s" * 2 + "%11.4g" * 5)
                     % (f"{epoch}/{epochs - 1}", mem, *mloss, targets.shape[0], imgs.shape[-1])
                 )
-                callbacks.run("on_train_batch_end", model, ni, imgs, targets, paths, list(mloss))
+                callbacks.run("on_train_batch_end", model, ni, imgs_disp, targets, paths, list(mloss))
                 if callbacks.stop_training:
                     return
             # end batch ------------------------------------------------------------------------------------------------

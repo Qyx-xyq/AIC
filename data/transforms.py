@@ -117,6 +117,8 @@ def random_perspective(
     """Applies a random perspective transformation to an image and its bounding boxes for data augmentation."""
     height = im.shape[0] + border[0] * 2  # shape(h,w,c)
     width = im.shape[1] + border[1] * 2
+    # 多模态拼接图(HxWx9)需用标量 borderValue,OpenCV 的 borderValue 长度上限为 4。
+    border_value = (114, 114, 114) if im.shape[2] == 3 else 114
 
     # Center
     C = np.eye(3)
@@ -150,9 +152,9 @@ def random_perspective(
     M = T @ S @ R @ P @ C  # order of operations (right to left) is IMPORTANT
     if (border[0] != 0) or (border[1] != 0) or (M != np.eye(3)).any():  # image changed
         if perspective:
-            im = cv2.warpPerspective(im, M, dsize=(width, height), borderValue=(114, 114, 114))
+            im = cv2.warpPerspective(im, M, dsize=(width, height), borderValue=border_value)
         else:  # affine
-            im = cv2.warpAffine(im, M[:2], dsize=(width, height), borderValue=(114, 114, 114))
+            im = cv2.warpAffine(im, M[:2], dsize=(width, height), borderValue=border_value)
 
     if n := len(targets):
         use_segments = any(x.any() for x in segments) and len(segments) == n

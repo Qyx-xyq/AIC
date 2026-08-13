@@ -2,11 +2,11 @@
 """
 验证 YOLOv3 检测模型(比赛精简版,仅支持 PyTorch .pt 权重)。
 
-数据加载 -> data11111new
-辅助工具 -> train11111new/utils
+数据加载 -> data
+辅助工具 -> train/utils
 
 用法:
-    $ python train11111new/val.py --weights yolov3-tiny.pt --data data/coco128.yaml --imgsz 640
+    $ python train/val.py --weights yolov3-tiny.pt --data data/coco128.yaml --imgsz 640
 """
 
 import argparse
@@ -19,15 +19,15 @@ import numpy as np
 import torch
 
 FILE = Path(__file__).resolve()
-ROOT = FILE.parents[0]  # train11111new/ 目录(本脚本所在目录)
+ROOT = FILE.parents[0]  # train/ 目录(本脚本所在目录)
 REPO_ROOT = ROOT.parent  # 仓库根目录(data11111new/models11111new/losses11111new 所在层级)
 if str(ROOT) not in sys.path:
-    sys.path.append(str(ROOT))  # 优先把 train11111new/ 加入 PATH,保证 utils 指向本目录
+    sys.path.append(str(ROOT))  # 优先把 train/ 加入 PATH,保证 utils 指向本目录
 if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))  # 保证 data11111new 可导入
+    sys.path.append(str(REPO_ROOT))  # 保证 data 可导入
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
-from data11111new import create_dataloader
+from data import create_dataloader
 from utils.callbacks import Callbacks
 from utils.experimental import attempt_load
 from utils.general import (
@@ -198,7 +198,12 @@ def run(
                 f"classes). Pass correct combination of --weights and --data that are trained together."
             )
         # warmup(纯 PyTorch 模型无 warmup 方法,空跑一次预热 CUDA)
-        model(torch.zeros((1 if pt else batch_size, 3, imgsz, imgsz), device=device))
+        in_ch = 3
+        for m in model.modules():
+            if isinstance(m, torch.nn.Conv2d):
+                in_ch = m.in_channels  # 三模态早融合模型为 9 通道
+                break
+        model(torch.zeros((1 if pt else batch_size, in_ch, imgsz, imgsz), device=device))
         pad, rect = (0.0, False) if task == "speed" else (0.5, pt)  # square inference for benchmarks
         task = task if task in ("train", "val", "test") else "val"  # path to train/val/test images
         dataloader = create_dataloader(
@@ -226,8 +231,16 @@ def run(
     jdict, stats, ap, ap_class = [], [], [], []
     callbacks.run("on_val_start")
     pbar = TQDM(dataloader, desc=s)  # progress bar
-    for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
+    for batch_i, batch in enumerate(pbar):
         callbacks.run("on_val_batch_start")
+        multimodal = len(batch) == 6
+        if multimodal:
+            im_vis, im_ir, im_dep, targets, paths, shapes = batch
+            im = torch.cat((im_vis, im_ir, im_dep), dim=1)  # 三模态早融合:通道维拼接
+            im_plot = im_vis  # 可视化用可见光图
+        else:
+            im, targets, paths, shapes = batch
+            im_plot = im
         with dt[0]:
             if cuda:
                 im = im.to(device, non_blocking=True)
@@ -292,10 +305,10 @@ def run(
 
         # Plot images
         if plots and batch_i < 3:
-            plot_images(im, targets, paths, save_dir / f"val_batch{batch_i}_labels.jpg", names)  # labels
-            plot_images(im, output_to_target(preds), paths, save_dir / f"val_batch{batch_i}_pred.jpg", names)  # pred
+            plot_images(im_plot, targets, paths, save_dir / f"val_batch{batch_i}_labels.jpg", names)  # labels
+            plot_images(im_plot, output_to_target(preds), paths, save_dir / f"val_batch{batch_i}_pred.jpg", names)  # pred
 
-        callbacks.run("on_val_batch_end", batch_i, im, targets, paths, shapes, preds)
+        callbacks.run("on_val_batch_end", batch_i, im_plot, targets, paths, shapes, preds)
 
     # Compute metrics
     stats = [torch.cat(x, 0).cpu().numpy() for x in zip(*stats)]  # to numpy

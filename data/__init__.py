@@ -14,14 +14,16 @@ train.py 只从这里 import,例如::
 依赖: ``numpy``, ``opencv-python``, ``torch``, ``pillow``, ``psutil`` 以及 ``ultralytics`` 包。
 """
 
-from .collate import collate_fn, collate_fn4
+from .collate import collate_fn, collate_fn3, collate_fn4
 from .dataset import (
     IMG_FORMATS,
+    MODALITY_DIRS,
     VID_FORMATS,
     InfiniteDataLoader,
     LoadImages,
     LoadImagesAndLabels,
     create_dataloader,
+    dataset_num_modalities,
     exif_size,
     verify_image_label,
 )
@@ -52,11 +54,13 @@ from .utils import (
 __all__ = [
     # dataset.py
     "IMG_FORMATS",
+    "MODALITY_DIRS",
     "VID_FORMATS",
     "InfiniteDataLoader",
     "LoadImages",
     "LoadImagesAndLabels",
     "create_dataloader",
+    "dataset_num_modalities",
     "exif_size",
     "verify_image_label",
     # transforms.py
@@ -71,6 +75,7 @@ __all__ = [
     "replicate",
     # collate.py
     "collate_fn",
+    "collate_fn3",
     "collate_fn4",
     # utils.py
     "letterbox",

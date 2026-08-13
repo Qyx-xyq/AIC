@@ -28,7 +28,7 @@ from ultralytics.data.build import seed_worker
 from ultralytics.data.utils import get_hash, img2label_paths
 from ultralytics.utils import LOGGER, TQDM
 
-from .collate import collate_fn, collate_fn4
+from .collate import collate_fn, collate_fn3, collate_fn4
 from .transforms import Albumentations, augment_hsv, copy_paste, mixup, random_perspective
 from .utils import letterbox, segments2boxes, xyn2xy, xywhn2xyxy, xyxy2xywhn
 
@@ -45,6 +45,48 @@ NUM_THREADS = min(8, max(1, os.cpu_count() - 1))  # number of YOLOv3 multiproces
 for orientation in ExifTags.TAGS:
     if ExifTags.TAGS[orientation] == "Orientation":
         break
+
+# 三模态比赛数据集:根目录下的模态文件夹(以第一个为锚点,同名文件一一对应)。
+MODALITY_DIRS = ("visible", "infared", "depth")
+LABEL_DIR_NAMES = ("labels",)
+
+
+# 解析某个模态的实际目录,兼容 infared/infrared 的拼写差异。
+def _resolve_modality_dir(root, name):
+    """Return the actual subfolder for modality `name`, tolerating the infared/infrared typo."""
+    root = Path(root)
+    if (root / name).is_dir():
+        return root / name
+    if name in ("infared", "infrared"):
+        alt = "infrared" if name == "infared" else "infared"
+        if (root / alt).is_dir():
+            return root / alt
+    return None
+
+
+# 查找 labels 标注目录。
+def _resolve_label_dir(root, names=LABEL_DIR_NAMES):
+    """Return the labels subfolder under `root`, or None if absent."""
+    root = Path(root)
+    for name in names:
+        if (root / name).is_dir():
+            return root / name
+    return None
+
+
+# 由锚点图像路径 + labels 目录得到同名 txt 标注路径。
+def _modal_to_label(im_file, labels_dir):
+    """Map a modality image path to its label txt path (same stem, .txt suffix)."""
+    return str(Path(labels_dir) / f"{Path(im_file).stem}.txt")
+
+
+# 判断目录是否为三模态比赛数据集,返回模态数量(普通单模态返回 1)。
+def dataset_num_modalities(path, modalities=MODALITY_DIRS):
+    """Return the number of modality folders under `path` (1 if the layout is not detected)."""
+    root = Path(path)
+    if root.is_dir() and _resolve_modality_dir(root, modalities[0]) is not None:
+        return len(modalities)
+    return 1
 
 
 # 考虑 EXIF 旋转元数据,返回修正后的图像宽高 (w, h)。
@@ -88,6 +130,7 @@ def create_dataloader(
     prefix="",
     shuffle=False,
     seed=0,
+    modalities=None,
 ):
     """Creates a DataLoader for training, with options for augmentation, caching, and parallelization."""
     if rect and shuffle:
@@ -107,6 +150,7 @@ def create_dataloader(
             pad=pad,
             image_weights=image_weights,
             prefix=prefix,
+            modalities=modalities,
         )
 
     batch_size = min(batch_size, len(dataset))
@@ -116,6 +160,7 @@ def create_dataloader(
     loader = DataLoader if image_weights else InfiniteDataLoader  # only DataLoader allows for attribute updates
     generator = torch.Generator()
     generator.manual_seed(6148914691236517205 + seed + RANK)
+    collate = collate_fn3 if getattr(dataset, "multimodal", False) else (collate_fn4 if quad else collate_fn)
     return loader(
         dataset,
         batch_size=batch_size,
@@ -123,7 +168,7 @@ def create_dataloader(
         num_workers=nw,
         sampler=sampler,
         pin_memory=PIN_MEMORY,
-        collate_fn=collate_fn4 if quad else collate_fn,
+        collate_fn=collate,
         worker_init_fn=seed_worker,
         generator=generator,
     ), dataset
@@ -309,6 +354,7 @@ class LoadImagesAndLabels(Dataset):
         pad=0.0,
         min_items=0,
         prefix="",
+        modalities=None,
     ):
         """Initializes a dataset with images and labels for YOLOv3 training and validation."""
         self.img_size = img_size
@@ -320,36 +366,84 @@ class LoadImagesAndLabels(Dataset):
         self.mosaic_border = [-img_size // 2, -img_size // 2]
         self.stride = stride
         self.path = path
+        self.modalities = tuple(modalities or MODALITY_DIRS)
+        self.multimodal = False
         self.albumentations = Albumentations(size=img_size) if augment else None
 
         try:
             f = []  # image files
-            for p in path if isinstance(path, list) else [path]:
-                p = Path(p)  # os-agnostic
-                if p.is_dir():  # dir
-                    f += glob.glob(str(p / "**" / "*.*"), recursive=True)
-                    # f = list(p.rglob('*.*'))  # pathlib
-                elif p.is_file():  # file
-                    with open(p) as t:
-                        t = t.read().strip().splitlines()
-                        parent = str(p.parent) + os.sep
-                        f += [x.replace("./", parent, 1) if x.startswith("./") else x for x in t]  # to global path
-                        # f += [p.parent / x.lstrip(os.sep) for x in t]  # to global path (pathlib)
-                else:
-                    raise FileNotFoundError(f"{prefix}{p} does not exist")
+            modal_files = None  # [visible_files, ir_files, depth_files] when multimodal
+            # 三模态比赛布局:path 为根目录,内含 visible/infared(infrared)/depth/labels 四个文件夹。
+            root = Path(path) if not isinstance(path, list) else None
+            anchor_dir = _resolve_modality_dir(root, self.modalities[0]) if root is not None else None
+            if root is not None and root.is_dir() and anchor_dir is not None:
+                self.multimodal = True
+                cache_images = False  # 多模态暂不做图像缓存,避免与拼接通道数不一致
+                self.albumentations = None  # 颜色类增强只对 RGB 有意义,三模态共享管线时关闭
+
+                anchor_files = sorted(
+                    x.replace("/", os.sep)
+                    for x in glob.glob(str(anchor_dir / "**" / "*.*"), recursive=True)
+                    if x.split(".")[-1].lower() in IMG_FORMATS
+                )
+                assert anchor_files, f"{prefix}No images found in {anchor_dir}"
+
+                dirs = [_resolve_modality_dir(root, m) for m in self.modalities]
+                missing = [m for m, d in zip(self.modalities, dirs) if d is None]
+                assert not missing, f"{prefix}Missing modality folders {missing} in {root}"
+                labels_dir = _resolve_label_dir(root)
+                assert labels_dir is not None, f"{prefix}Missing labels folder in {root}"
+                self.label_root = labels_dir
+
+                modal_files = []
+                for d in dirs:
+                    files = []
+                    for af in anchor_files:
+                        rel = os.path.relpath(af, anchor_dir)
+                        mf = os.path.normpath(os.path.join(d, rel))
+                        assert os.path.isfile(mf), f"{prefix}Missing paired image {mf}"
+                        files.append(mf)
+                    modal_files.append(files)
+                f = anchor_files
+            else:
+                for p in path if isinstance(path, list) else [path]:
+                    p = Path(p)  # os-agnostic
+                    if p.is_dir():  # dir
+                        f += glob.glob(str(p / "**" / "*.*"), recursive=True)
+                        # f = list(p.rglob('*.*'))  # pathlib
+                    elif p.is_file():  # file
+                        with open(p) as t:
+                            t = t.read().strip().splitlines()
+                            parent = str(p.parent) + os.sep
+                            f += [x.replace("./", parent, 1) if x.startswith("./") else x for x in t]  # to global path
+                            # f += [p.parent / x.lstrip(os.sep) for x in t]  # to global path (pathlib)
+                    else:
+                        raise FileNotFoundError(f"{prefix}{p} does not exist")
             self.im_files = sorted(x.replace("/", os.sep) for x in f if x.split(".")[-1].lower() in IMG_FORMATS)
             # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in IMG_FORMATS])  # pathlib
             assert self.im_files, f"{prefix}No images found"
+            if modal_files is not None:
+                self.modal_im_files = modal_files  # 与 self.im_files 顺序严格一致
         except Exception as e:
             raise RuntimeError(f"{prefix}Error loading data from {path}: {e}\n{HELP_URL}") from e
 
         # Check cache
-        self.label_files = img2label_paths(self.im_files)  # labels
-        cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix(".cache")
+        if self.multimodal:
+            self.label_files = [_modal_to_label(f, self.label_root) for f in self.im_files]  # labels
+            cache_path = self.label_root.with_suffix(".cache")
+        else:
+            self.label_files = img2label_paths(self.im_files)  # labels
+            cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix(".cache")
+        # 缓存哈希需覆盖所有模态文件,避免某个模态更新后仍命中旧缓存。
+        self.cache_hash_files = (
+            self.label_files + [mf for files in self.modal_im_files for mf in files]
+            if self.multimodal
+            else self.label_files + self.im_files
+        )
         try:
             cache, exists = np.load(cache_path, allow_pickle=True).item(), True  # load dict
             assert cache["version"] == self.cache_version  # matches current version
-            assert cache["hash"] == get_hash(self.label_files + self.im_files)  # identical hash
+            assert cache["hash"] == get_hash(self.cache_hash_files)  # identical hash
         except Exception:
             cache, exists = self.cache_labels(cache_path, prefix), False  # run cache ops
 
@@ -370,7 +464,10 @@ class LoadImagesAndLabels(Dataset):
         self.labels = list(labels)
         self.shapes = np.array(shapes)
         self.im_files = list(cache.keys())  # update
-        self.label_files = img2label_paths(cache.keys())  # update
+        if self.multimodal:
+            self.label_files = [_modal_to_label(f, self.label_root) for f in self.im_files]  # update
+        else:
+            self.label_files = img2label_paths(cache.keys())  # update
 
         # Filter images
         if min_items:
@@ -381,6 +478,8 @@ class LoadImagesAndLabels(Dataset):
             self.labels = [self.labels[i] for i in include]
             self.segments = [self.segments[i] for i in include]
             self.shapes = self.shapes[include]  # wh
+            if self.multimodal:
+                self.modal_im_files = [[mfs[i] for i in include] for mfs in self.modal_im_files]
 
         # Create indices
         n = len(self.shapes)  # number of images
@@ -415,6 +514,8 @@ class LoadImagesAndLabels(Dataset):
             self.segments = [self.segments[i] for i in irect]
             self.shapes = s[irect]  # wh
             ar = ar[irect]
+            if self.multimodal:
+                self.modal_im_files = [[mfs[i] for i in irect] for mfs in self.modal_im_files]
 
             # Set training image shapes
             shapes = [[1, 1]] * nb
@@ -495,7 +596,7 @@ class LoadImagesAndLabels(Dataset):
             LOGGER.info("\n".join(msgs))
         if nf == 0:
             LOGGER.warning(f"{prefix}No labels found in {path}. {HELP_URL}")
-        x["hash"] = get_hash(self.label_files + self.im_files)
+        x["hash"] = get_hash(self.cache_hash_files)
         x["results"] = nf, nm, ne, nc, len(self.im_files)
         x["msgs"] = msgs  # warnings
         x["version"] = self.cache_version  # cache version
@@ -558,14 +659,15 @@ class LoadImagesAndLabels(Dataset):
             labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1e-3)
 
         if self.augment:
-            # Albumentations
-            img, labels = self.albumentations(img, labels)
-            nl = len(labels)  # update after albumentations
+            if not self.multimodal:
+                # Albumentations
+                img, labels = self.albumentations(img, labels)
+                nl = len(labels)  # update after albumentations
 
-            # HSV color-space
-            augment_hsv(img, hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
+                # HSV color-space
+                augment_hsv(img, hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
 
-            # Flip up-down
+            # Flip up-down(几何增强对三个模态一致应用)
             if random.random() < hyp["flipud"]:
                 img = np.flipud(img)
                 if nl:
@@ -585,7 +687,13 @@ class LoadImagesAndLabels(Dataset):
         if nl:
             labels_out[:, 1:] = torch.from_numpy(labels)
 
-        # Convert
+        # Convert:单模态 HWC->CHW + BGR->RGB;多模态先按通道拆成三组,再分别转 CHW。
+        if self.multimodal:
+            ims = np.split(img, len(self.modalities), axis=2)  # list of HxWx3
+            ims_out = [torch.from_numpy(np.ascontiguousarray(im.transpose((2, 0, 1))[::-1])) for im in ims]
+            # 返回 (visible, infared, depth, labels, path, shapes) 三组图像 + 共享标签。
+            return (*ims_out, labels_out, self.im_files[index], shapes)
+
         img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
         img = np.ascontiguousarray(img)
 
@@ -593,7 +701,25 @@ class LoadImagesAndLabels(Dataset):
         return torch.from_numpy(img), labels_out, self.im_files[index], shapes
 
     def load_image(self, i):
-        """Loads a single image by index, returning the image, its original dimensions, and resized dimensions."""
+        """Loads image(s) by index, returning the image, its original dimensions, and resized dimensions."""
+        # 多模态:同时读取三个模态并按通道拼接成 HxWx(3*n),保证后续几何增强完全一致。
+        if self.multimodal:
+            ims = []
+            h0 = w0 = None
+            for files in self.modal_im_files:
+                im = cv2.imread(files[i])  # BGR
+                assert im is not None, f"Image Not Found {files[i]}"
+                if h0 is None:
+                    h0, w0 = im.shape[:2]  # orig hw(三个模态对应同一张照片,尺寸一致)
+                    r = self.img_size / max(h0, w0)  # ratio
+                    interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
+                    new_hw = (math.ceil(w0 * r), math.ceil(h0 * r)) if r != 1 else (w0, h0)
+                if im.shape[:2] != new_hw:
+                    im = cv2.resize(im, new_hw, interpolation=interp)
+                ims.append(im)
+            im = np.concatenate(ims, axis=2)  # HxWx(3*num_modalities)
+            return im, (h0, w0), im.shape[:2]  # im, hw_original, hw_resized
+
         im, f, fn = (
             self.ims[i],
             self.im_files[i],
@@ -717,6 +843,8 @@ def verify_image_label(args):
                     lb = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
                 lb = np.array(lb, dtype=np.float32)
             if nl := len(lb):
+                if lb.ndim == 2 and lb.shape[1] > 5:
+                    lb = lb[:, :5]  # 比赛格式允许末尾带 confidence,训练只需 class_id + xywh
                 assert lb.shape[1] == 5, f"labels require 5 columns, {lb.shape[1]} columns detected"
                 assert (lb >= 0).all(), f"negative label values {lb[lb < 0]}"
                 assert (lb[:, 1:] <= 1).all(), f"non-normalized or out of bounds coordinates {lb[:, 1:][lb[:, 1:] > 1]}"
