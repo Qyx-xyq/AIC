@@ -328,14 +328,19 @@ def train(hyp, opt, device, callbacks):
             ni = i + nb * epoch  # number integrated batches (since train start)
             if num_modalities > 1:
                 im_vis, im_ir, im_dep, targets, paths, _ = batch
-                # 三模态早融合:通道维拼接后交给单骨干网络;若要换成其他融合结构,在此处修改。
-                imgs = torch.cat((im_vis, im_ir, im_dep), dim=1)
-                imgs_disp = im_vis  # 可视化/回调用可见光图
+                # 三模态独立输入，分别送进网络
+                im_vis = im_vis.to(device, non_blocking=True).float() / 255
+                im_ir = im_ir.to(device, non_blocking=True).float() / 255
+                im_dep = im_dep.to(device, non_blocking=True).float() / 255
+                imgs_disp = im_vis  # 可视化用可见光图
+                targets = targets.to(device)
+                pred = model(im_vis, im_ir, im_dep)
             else:
                 imgs, targets, paths, _ = batch
-                imgs_disp = imgs
-            imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
-
+                imgs = imgs.to(device, non_blocking=True).float() / 255
+                targets = targets.to(device)
+                pred = model(imgs)
+                
             # Warmup
             if ni <= nw:
                 xi = [0, nw]  # x interp
