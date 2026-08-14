@@ -571,6 +571,7 @@ class MultiModalDetectionModel(BaseModel):
     def __init__(self, cfg='yolov3-spp.yaml', ch=(3, 3, 3), nc=None, anchors=None):
         super().__init__()
         self.num_modalities = len(ch)
+        self.names = [str(i) for i in range(nc)] if nc else []
         
         import yaml
         with open(cfg, 'r') as f:
@@ -579,48 +580,77 @@ class MultiModalDetectionModel(BaseModel):
         # 构建三个独立 backbone
         self.backbones = nn.ModuleList()
         for c in ch:
-            backbone_cfg = deepcopy(self.yaml)
-            backbone_cfg['ch'] = c
-            model, save = parse_model(
-                {'backbone': backbone_cfg['backbone'],
-                 'head': [], 
-                 'nc': backbone_cfg['nc'], 
-                 'depth_multiple': backbone_cfg['depth_multiple'], 
-                 'width_multiple': backbone_cfg['width_multiple'],
-                 'anchors': backbone_cfg['anchors']}, 
+            temp_cfg = deepcopy(self.yaml)
+            temp_cfg['ch'] = c
+            temp_model, save = parse_model(
+                {'backbone': temp_cfg['backbone'],
+                 'head': temp_cfg['head'], 
+                 'nc': temp_cfg['nc'], 
+                 'depth_multiple': temp_cfg['depth_multiple'], 
+                 'width_multiple': temp_cfg['width_multiple'],
+                 'anchors': temp_cfg['anchors']}, 
                 ch=[c]
             )
+            backbone_layers = nn.Sequential(*[temp_model[i] for i in range(11)])
             backbone_wrapper = BaseModel()
-            backbone_wrapper.model = model
+            backbone_wrapper.model = backbone_layers
             backbone_wrapper.save = save
             self.backbones.append(backbone_wrapper)
+            del temp_model
         
         # 定义融合模块（在 P3, P4, P5 三个尺度分别融合）
         self.fusion_p3 = MultiModalFusion(c1=256, c2=256, hide_channel=8)
         self.fusion_p4 = MultiModalFusion(c1=512, c2=512, hide_channel=8)
         self.fusion_p5 = MultiModalFusion(c1=1024, c2=1024, hide_channel=8)
         
-        # 构建 head（使用原 YAML 的 head 部分）
-        head_layers, head_save = parse_model(
-            {'backbone': [],
-             'head': self.yaml['head'], 
-             'nc': self.yaml['nc'],
-             'depth_multiple': self.yaml['depth_multiple'],
-             'width_multiple': self.yaml['width_multiple'],
-             'anchors': self.yaml['anchors']},
-            ch=[256, 512, 1024] 
+        # 构建 head（从 YAML 中解析 head 部分）
+                
+        full_model, full_save = parse_model(
+            {
+                'backbone': self.yaml['backbone'],
+                'head': self.yaml['head'],
+                'nc': self.yaml['nc'],
+                'depth_multiple': self.yaml['depth_multiple'],
+                'width_multiple': self.yaml['width_multiple'],
+                'anchors': self.yaml['anchors']
+            },
+            ch=[3]  # 单流输入，只是为了解析 head 结构
         )
-        self.head = head_layers
-        self.save = head_save
+                
+        head_layers = []
+        for i in range(11, len(full_model)):
+            m = full_model[i]
+            # 修改 m.f 适配输入
+            if m.f != -1:
+                if isinstance(m.f, int):
+                    if m.f in [6, 8, 10]:  # P3, P4, P5
+                        m.f = [0, 1, 2][[6, 8, 10].index(m.f)]
+                elif isinstance(m.f, list):
+                    new_f = []
+                    for f in m.f:
+                        if f in [6, 8, 10]:
+                            new_f.append([0, 1, 2][[6, 8, 10].index(f)])
+                        elif f == -1:
+                            new_f.append(-1)
+                        else:
+                            new_f.append(f)
+                    m.f = new_f
+            head_layers.append(m)
+
+        self.head = nn.ModuleList(head_layers)
         
         # 初始化检测头
         m = self.head[-1]
         if isinstance(m, Detect):
             s = 256
-            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, 3, s, s))])
+            dummy = torch.zeros(1, 3, s, s)
+            m.stride = torch.tensor([s / x.shape[-2] for x in self._forward_dummy(dummy)])
             m.anchors /= m.stride.view(-1, 1, 1)
             check_anchor_order(m)
             self.stride = m.stride
+
+    def _forward_dummy(self, x):
+        return self.forward(x, x, x)
     
     def forward(self, x_rgb, x_depth, x_ir, augment=False, profile=False, visualize=False):
         """
@@ -639,7 +669,10 @@ class MultiModalDetectionModel(BaseModel):
         x = [p3_fused, p4_fused, p5_fused]
         for m in self.head:
             if m.f != -1:
-                x = [x[j] if isinstance(j, int) else [x[k] for k in j] for j in m.f]
+                if isinstance(m.f, int):
+                    x = [x[m.f]]
+                else:
+                    x = [x[j] if isinstance(j, int) else [x[k] for k in j] for j in m.f]
             x = m(x)
         
         return x
@@ -654,5 +687,5 @@ class MultiModalDetectionModel(BaseModel):
             y.append(x if m.i in backbone.save else None)
         
         # 需要根据实际 YAML 调整这些索引
-        p3_idx, p4_idx, p5_idx = 6, 8, 10  # 以 yolov3-spp.yaml 为例
+        p3_idx, p4_idx, p5_idx = 6, 8, 10 
         return [y[p3_idx], y[p4_idx], y[p5_idx]]
