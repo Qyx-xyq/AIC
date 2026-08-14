@@ -167,7 +167,21 @@ def train(hyp, opt, device, callbacks):
     else:
         model = Model(cfg, ch=ch, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
     amp = check_amp(model)  # check AMP
+    """参考：
+    原代码（单流模型）
+    model = Model(cfg or ckpt["model"].yaml, ch=ch, nc=nc, anchors=hyp.get("anchors")).to(device)
 
+    替换为（三流模型）
+    from models import MultiModalDetectionModel
+    model = MultiModalDetectionModel(
+        cfg=cfg or ckpt["model"].yaml, 
+        ch=(3, 3, 3),           
+        nc=nc, 
+        anchors=hyp.get("anchors")
+    ).to(device)
+    |——要考虑是否加载预训练权重（预训练权重通常是单流模型的权重，三流模型可能需要自定义加载方式）
+    |——我的想法是主要加载RGB权重？
+    """
     # Freeze
     freeze = [f"model.{x}." for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
     for k, v in model.named_parameters():
