@@ -574,8 +574,15 @@ class MultiModalDetectionModel(BaseModel):
         self.names = [str(i) for i in range(nc)] if nc else []
         
         import yaml
-        with open(cfg, 'r') as f:
-            self.yaml = yaml.safe_load(f)
+        if isinstance(cfg, dict):
+            self.yaml = deepcopy(cfg)
+        else:
+            with open(cfg, 'r') as f:
+                self.yaml = yaml.safe_load(f)
+        if nc is not None:
+            self.yaml["nc"] = nc
+        if anchors is not None:
+            self.yaml["anchors"] = anchors
         
         # 构建三个独立 backbone
         self.backbones = nn.ModuleList()
@@ -617,30 +624,17 @@ class MultiModalDetectionModel(BaseModel):
             ch=[3]  # 单流输入，只是为了解析 head 结构
         )
                 
-        head_layers = []
-        for i in range(11, len(full_model)):
-            m = full_model[i]
-            # 修改 m.f 适配输入
-            if m.f != -1:
-                if isinstance(m.f, int):
-                    if m.f in [6, 8, 10]:  # P3, P4, P5
-                        m.f = [0, 1, 2][[6, 8, 10].index(m.f)]
-                elif isinstance(m.f, list):
-                    new_f = []
-                    for f in m.f:
-                        if f in [6, 8, 10]:
-                            new_f.append([0, 1, 2][[6, 8, 10].index(f)])
-                        elif f == -1:
-                            new_f.append(-1)
-                        else:
-                            new_f.append(f)
-                    m.f = new_f
-            head_layers.append(m)
+        head_layers = [full_model[i] for i in range(11, len(full_model))]
 
         self.head = nn.ModuleList(head_layers)
+        # Keep the standard YOLOv3 model contract: loss, EMA and checkpoint code
+        # obtain the Detect layer from model[-1]. The custom forward below keeps
+        # the original YAML layer indices in `y` while running the head.
+        self.model = self.head
+        self.save = full_save
         
         # 初始化检测头
-        m = self.head[-1]
+        m = self.model[-1]
         if isinstance(m, Detect):
             s = 256
             dummy = torch.zeros(1, 3, s, s)
@@ -666,14 +660,18 @@ class MultiModalDetectionModel(BaseModel):
         p4_fused = self.fusion_p4(feat_rgb[1], feat_depth[1], feat_ir[1])
         p5_fused = self.fusion_p5(feat_rgb[2], feat_depth[2], feat_ir[2])
         
-        x = [p3_fused, p4_fused, p5_fused]
-        for m in self.head:
+        # Seed the original YAML indices used by the head: 6=P3, 8=P4, 10=P5.
+        y = [None] * 11
+        y[6], y[8], y[10] = p3_fused, p4_fused, p5_fused
+        x = p5_fused
+        for m in self.model:
             if m.f != -1:
                 if isinstance(m.f, int):
-                    x = [x[m.f]]
+                    x = y[m.f]
                 else:
-                    x = [x[j] if isinstance(j, int) else [x[k] for k in j] for j in m.f]
+                    x = [x if j == -1 else y[j] for j in m.f]
             x = m(x)
+            y.append(x if m.i in self.save else None)
         
         return x
     
