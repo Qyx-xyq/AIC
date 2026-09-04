@@ -527,7 +527,7 @@ class MultiModalBackbone(nn.Module):
         self.p4_idx = 8
         self.p5_idx = 10
     
-    def forward(self, x_rgb, x_depth, x_ir):
+    def forward(self, x_rgb, x_ir, x_depth):
         """
         输入：三个模态的图像 [B, 3, H, W]
         输出：三个模态的 P3, P4, P5 特征图
@@ -536,7 +536,7 @@ class MultiModalBackbone(nn.Module):
         outs_depth = []
         outs_ir = []
         
-        for i, (x, backbone) in enumerate(zip([x_rgb, x_depth, x_ir], self.backbones)):
+        for i, (x, backbone) in enumerate(zip([x_rgb, x_ir, x_depth], self.backbones)):
             y = []
             x_i = x
             for m in backbone.model:
@@ -571,7 +571,8 @@ class MultiModalDetectionModel(BaseModel):
     def __init__(self, cfg='yolov3-spp.yaml', ch=(3, 3, 3), nc=None, anchors=None):
         super().__init__()
         self.num_modalities = len(ch)
-        self.names = [str(i) for i in range(nc)] if nc else []
+        self.nc = nc if nc is not None else 0
+        self.names = [str(i) for i in range(self.nc)]
         
         import yaml
         if isinstance(cfg, dict):
@@ -626,11 +627,10 @@ class MultiModalDetectionModel(BaseModel):
                 
         head_layers = [full_model[i] for i in range(11, len(full_model))]
 
-        self.head = nn.ModuleList(head_layers)
         # Keep the standard YOLOv3 model contract: loss, EMA and checkpoint code
         # obtain the Detect layer from model[-1]. The custom forward below keeps
         # the original YAML layer indices in `y` while running the head.
-        self.model = self.head
+        self.model = nn.ModuleList(head_layers)
         self.save = full_save
         
         # 初始化检测头
@@ -646,14 +646,14 @@ class MultiModalDetectionModel(BaseModel):
     def _forward_dummy(self, x):
         return self.forward(x, x, x)
     
-    def forward(self, x_rgb, x_depth, x_ir, augment=False, profile=False, visualize=False):
+    def forward(self, x_rgb, x_ir, x_depth, augment=False, profile=False, visualize=False):
         """
         输入：三个模态的图像
         """
         # 1. 分别通过三个 backbone
         feat_rgb = self._forward_backbone(self.backbones[0], x_rgb)
-        feat_depth = self._forward_backbone(self.backbones[1], x_depth)
-        feat_ir = self._forward_backbone(self.backbones[2], x_ir)
+        feat_ir = self._forward_backbone(self.backbones[1], x_ir)
+        feat_depth = self._forward_backbone(self.backbones[2], x_depth)
         
         # 分别融合
         p3_fused = self.fusion_p3(feat_rgb[0], feat_depth[0], feat_ir[0])

@@ -172,17 +172,20 @@ def train(hyp, opt, device, callbacks):
             # Initialize every stream from the single-stream checkpoint where shapes match.
             mapped = {}
             for key, value in csd.items():
-                if not key.startswith("model."):
+                if key.startswith("backbones."):
+                    target_keys = [key]
+                elif key.startswith("model."):
+                    layer, _, suffix = key[6:].partition(".")
+                    if not layer.isdigit():
+                        continue
+                    layer_index = int(layer)
+                    target_keys = (
+                        [f"backbones.{stream}.model.{layer_index}.{suffix}" for stream in range(3)]
+                        if layer_index < 11
+                        else [f"model.{layer_index - 11}.{suffix}"]
+                    )
+                else:
                     continue
-                layer, _, suffix = key[6:].partition(".")
-                if not layer.isdigit():
-                    continue
-                layer_index = int(layer)
-                target_keys = (
-                    [f"backbones.{stream}.model.{layer_index}.{suffix}" for stream in range(3)]
-                    if layer_index < 11
-                    else [f"model.{layer_index - 11}.{suffix}"]
-                )
                 for target_key in target_keys:
                     mapped[target_key] = value
             csd = mapped
@@ -212,7 +215,12 @@ def train(hyp, opt, device, callbacks):
     |——我的想法是主要加载RGB权重？
     """
     # Freeze
-    freeze = [f"model.{x}." for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
+    freeze_layers = freeze if len(freeze) > 1 else range(freeze[0])
+    freeze = (
+        [f"backbones.{stream}.model.{layer}." for stream in range(3) for layer in freeze_layers]
+        if multimodal
+        else [f"model.{layer}." for layer in freeze_layers]
+    )  # layers to freeze
     for k, v in model.named_parameters():
         v.requires_grad = True  # train all layers
         if any(x in k for x in freeze):
