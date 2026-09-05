@@ -682,7 +682,9 @@ class MultiModalDetectionModel(BaseModel):
             if m.f != -1:
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
             x = m(x)
-            y.append(x if m.i in backbone.save else None)
+            # P3/P4/P5 are fusion inputs and must be retained even though the
+            # truncated backbone no longer has the original head skip links.
+            y.append(x if m.i in backbone.save or m.i in {6, 8, 10} else None)
         
         # 需要根据实际 YAML 调整这些索引
         p3_idx, p4_idx, p5_idx = 6, 8, 10 

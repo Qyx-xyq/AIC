@@ -26,7 +26,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run one random tri-stream YOLO training step")
     parser.add_argument("--device", default="cuda", help="cuda, cpu, or cuda:0")
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--imgsz", type=int, default=128)
+    parser.add_argument("--imgsz", type=int, default=64)
     parser.add_argument("--nc", type=int, default=12)
     return parser.parse_args()
 
@@ -48,6 +48,7 @@ def main():
     with hyp_path.open(encoding="utf-8") as file:
         hyp = yaml.safe_load(file)
 
+    print(f"building model on {device}...", flush=True)
     model = MultiModalDetectionModel(str(cfg_path), ch=(3, 3, 3), nc=args.nc).to(device)
     model.hyp = hyp
     model.nc = args.nc
@@ -75,9 +76,13 @@ def main():
     compute_loss = ComputeLoss(model)
 
     optimizer.zero_grad(set_to_none=True)
+    print("running forward...", flush=True)
     predictions = model(*images)
+    print("computing loss...", flush=True)
     total_loss, loss_items = compute_loss(predictions, targets)
+    print("running backward...", flush=True)
     total_loss.backward()
+    print("running optimizer step...", flush=True)
     optimizer.step()
 
     print(f"device: {device}")
